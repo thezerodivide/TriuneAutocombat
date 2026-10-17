@@ -16946,6 +16946,8 @@ local function buffActive(id, name, minSec)
         local m = nil
         pcall(function() m = mq.TLO.Group.Member(i) end)
         if m and m() and (m.ID() or 0) == id then
+            local cached = runtime.groupBuffStatus(id, name, minSec)
+            if cached ~= nil then return cached end
             if hasNamedBuff(m, name, false, minSec) then return true end
             if minSec == 0 and tloTrue(function() return m.Song(name)() end) then return true end ---@diagnostic disable-line: undefined-field
             return false
@@ -17220,7 +17222,7 @@ function runtime.isRedirectableHeal(name, entry, spell)
     end
 
     local ok, beneficial, targetType = pcall(function()
-        spell = spell or mq.TLO.Spell(name)
+        spell = spell or runtime.actionSpell(name, entry)
         if not spell or not spell() then return false end
         return spell.Beneficial() == true, tostring(spell.TargetType() or ''):lower()
     end)
@@ -17237,7 +17239,40 @@ function runtime.isRedirectableHeal(name, entry, spell)
         or checkHasSPA(spell, nil, nil, 147)
 end
 
-function runtime.isTargetInRange(name, targetId)
+function runtime.actionSpell(name, entry)
+    local aaName = nil
+    if entry and loadout then
+        for key, a in pairs(loadout.aas or {}) do
+            if a == entry then aaName = tostring(key):match('^%s*(.-)%s*$'); break end
+        end
+    end
+    local sp = nil
+    if not aaName then
+        pcall(function()
+            local candidate = mq.TLO.Spell(name)
+            if candidate and candidate() then sp = candidate end
+        end)
+    end
+    if not sp then
+        pcall(function()
+            local aa = mq.TLO.Me.AltAbility(aaName or name)
+            if aa and aa() and aa.Spell and aa.Spell() then sp = aa.Spell end
+        end)
+    end
+    if not sp and not aaName and entry and entry.name and entry.name ~= '' then
+        pcall(function()
+            local item = mq.TLO.FindItem('=' .. entry.name)
+            if not item or not item() then item = mq.TLO.FindItem(entry.name) end
+            if item and item() and item.Clicky and item.Clicky()
+                and item.Clicky.Spell and item.Clicky.Spell() then
+                sp = item.Clicky.Spell
+            end
+        end)
+    end
+    return sp
+end
+
+function runtime.isTargetInRange(name, targetId, entry)
     if not targetId or targetId == 0 then return false end
     local myId = mq.TLO.Me.ID() or 0
     if targetId == myId then return true end
@@ -17248,8 +17283,8 @@ function runtime.isTargetInRange(name, targetId)
     local maxRange = 0
     if name and name ~= '' then
         pcall(function()
-            local sp = mq.TLO.Spell(name)
-            if sp() then
+            local sp = runtime.actionSpell(name, entry)
+            if sp then
                 local r = sp.Range() or 0
                 if r > 0 then maxRange = r end
             end
@@ -17308,8 +17343,18 @@ end
 function runtime.boxnetCounters(name)
     local bn = runtime.boxnetApi()
     if not bn or type(bn.peerCounters) ~= 'function' or not name or name == '' then return nil end
-    local ok, c = pcall(bn.peerCounters, name, runtime.BOXNET_FRESH_SEC or 3.0)
-    if ok and type(c) == 'table' then return c end
+    local ok, c, schema = pcall(bn.peerCounters, name, runtime.BOXNET_FRESH_SEC or 3.0)
+    if ok and type(c) == 'table' then
+        if schema == 1 then return c end
+        -- An older local plugin cannot distinguish a failed counter read from
+        -- zero. Keep its positives, but let unknown zeros use the usual fallback.
+        local known = {}
+        for key, value in pairs(c) do
+            local count = tonumber(value)
+            if count and count > 0 and count < math.huge then known[key] = count end
+        end
+        return next(known) and known or nil
+    end
     return nil
 end
 
@@ -17977,14 +18022,307 @@ function runtime.findSelfDefenseTarget(maxDist)
     return nil
 end
 
--- Shared poison/disease probe. `kind` is 'Poison' or 'Disease'; the two
--- afflictions are exposed through identically shaped TLO members
--- (Me.Poisoned / Me.Diseased, CountersPoison / CountersDisease, ...), so one
--- walker covers both and the public helpers below just pick the kind.
+-- Group spawns inherit cached buffs, not Me's counters or Target's affliction
+-- members. Counter SPAs let the same cache probe identify every cure type.
+-- Ordered missing-buff entries share the same cache freshness and inspection state.
 local AFFLICTION_MEMBERS = {
-    Poison  = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison' },
-    Disease = { flag = 'Diseased', counter = 'CountersDisease', boxnet = 'disease' },
+    Poison     = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison', spa = 36 },
+    Disease    = { flag = 'Diseased', counter = 'CountersDisease', boxnet = 'disease', spa = 35 },
+    Curse      = { flag = 'Cursed', counter = 'CountersCurse', boxnet = 'curse', spa = 116 },
+    Corruption = { flag = 'Corrupted', counter = 'CountersCorruption', boxnet = 'corruption', spa = 369 },
 }
+
+function runtime.cachedGroupBuffs(targetId)
+    if not targetId or targetId <= 0 then return nil end
+    local s = nil
+    pcall(function() s = mq.TLO.Spawn(targetId) end)
+    if not s or not s() then return nil end
+
+    local fresh = false
+    pcall(function()
+        fresh = (mq.TLO.Target.ID() or 0) == targetId and mq.TLO.Target.BuffsPopulated() == true
+    end)
+    local observed = runtime.groupCureObserved and runtime.groupCureObserved[targetId]
+    fresh = fresh or (observed ~= nil and os.clock() - observed < 3)
+    local count = -1
+    pcall(function() count = tonumber(s.CachedBuffCount()) or -1 end)
+    if count < 0 then pcall(function() count = tonumber(s.BuffCount()) or -1 end) end
+    if count < 0 then return nil end
+
+    local buffs, cacheFresh = {}, count > 0
+    for i = 1, count do
+        local b = nil
+        pcall(function() b = s.Buff(i) end)
+        local valid = false
+        pcall(function()
+            local value = b and b()
+            valid = value ~= nil and value ~= false and value ~= '' and value ~= 'NULL'
+        end)
+        if not valid then
+            pcall(function() b = s.CachedBuff('*' .. i) end)
+            pcall(function()
+                local value = b and b()
+                valid = value ~= nil and value ~= false and value ~= '' and value ~= 'NULL'
+            end)
+        end
+        if not valid then return nil end
+        local age = nil
+        pcall(function() age = tonumber(b.Staleness.TotalSeconds()) end)
+        if age == nil or age < 0 or age >= 3 then cacheFresh = false end
+        buffs[#buffs + 1] = b
+    end
+    if not fresh and not cacheFresh then return nil end
+    return buffs
+end
+
+function runtime.groupBuffStatus(targetId, name, minSec)
+    if not name or name == '' or name == 'NULL' then return nil end
+    minSec = tonumber(minSec) or 0
+    local function matches(buffName)
+        return buffName == name or (type(buffName) == 'string' and
+            (buffName:lower() == name:lower() or isGemMatching(buffName, name)))
+    end
+    local bn = runtime.boxnetApi()
+    if bn and type(bn.peerBuffs) == 'function' then
+        local peerName = nil
+        pcall(function() peerName = mq.TLO.Spawn(targetId).CleanName() end)
+        local ok, reported, age = pcall(bn.peerBuffs, peerName, runtime.BOXNET_FRESH_SEC or 3.0)
+        if ok and type(reported) == 'table' and type(age) == 'number' and age >= 0 and age < math.huge then
+            for _, b in ipairs(reported) do
+                if matches(b.name) then
+                    local remaining = math.max(0, b.duration - age)
+                    if minSec > 0 then
+                        if remaining > minSec then return true end
+                    elseif b.duration == 0 or remaining > 0 then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+    end
+    local buffs = runtime.cachedGroupBuffs(targetId)
+    if not buffs then return nil end
+    for _, b in ipairs(buffs) do
+        local buffName = nil
+        pcall(function() buffName = b.Name() end)
+        if not buffName or buffName == '' then
+            pcall(function() buffName = b.Spell.Name() end)
+        end
+        if not buffName or buffName == '' then return nil end
+        if matches(buffName) then
+            local remaining = -1
+            pcall(function() remaining = tonumber(b.Duration.TotalSeconds()) or -1 end)
+            if minSec > 0 and remaining >= 0 then return remaining > minSec end
+            return true
+        end
+    end
+    return false
+end
+
+function runtime.cachedAfflictionStatus(targetId, kind)
+    local members = AFFLICTION_MEMBERS[kind]
+    if not members then return nil end
+    local buffs = runtime.cachedGroupBuffs(targetId)
+    if not buffs then return nil end
+    local afflicted = false
+    for _, b in ipairs(buffs) do
+        local ok, sp, beneficial = pcall(function()
+            local spell = b.Spell or b
+            return spell, spell.Beneficial()
+        end)
+        if not ok or beneficial == nil then return nil end
+        if beneficial == false and checkHasSPA(sp, nil, nil, members.spa) then afflicted = true end
+    end
+    return afflicted
+end
+
+function runtime.groupAfflictionStatus(targetId, kind)
+    local members = AFFLICTION_MEMBERS[kind]
+    if not members or not targetId or targetId <= 0 then return nil end
+    local name = nil
+    pcall(function() name = mq.TLO.Spawn(targetId).CleanName() end)
+    local counters = name and runtime.boxnetCounters(name)
+    local count = counters and tonumber(counters[members.boxnet])
+    if count ~= nil then return count > 0 end
+
+    local function status(obj)
+        local count, value = nil, nil
+        pcall(function() count = tonumber(obj[members.counter]()) end)
+        pcall(function() value = obj[members.flag]() end)
+        local numeric = tonumber(value)
+        if (count and count > 0) or (numeric and numeric > 0) or value == true then return true end
+        if type(value) == 'string' and numeric == nil and value ~= '' and value ~= 'NULL' and value ~= 'nil' then
+            return true
+        end
+        if count ~= nil or numeric ~= nil or value == false then return false end
+        return nil
+    end
+    local nb = nil
+    pcall(function() nb = name and mq.TLO.NetBots(name) end)
+    if nb and nb() then
+        local result = status(nb)
+        local detrimental = ''
+        pcall(function() detrimental = tostring(nb.Detrimental() or '') end)
+        if detrimental:find(kind, 1, true) then return true end
+        if result == true then return true end
+    end
+    local total = 0
+    pcall(function() total = mq.TLO.Group.Members() or 0 end)
+    for i = 0, total do
+        local m = nil
+        pcall(function() m = mq.TLO.Group.Member(i) end)
+        local matches = false
+        pcall(function() matches = m ~= nil and m() ~= nil and m.ID() == targetId end)
+        if matches then
+            local result = status(m)
+            if result ~= nil then return result end
+        end
+    end
+    return runtime.cachedAfflictionStatus(targetId, kind)
+end
+
+function runtime.groupCureNeedsProbe(targetId, when, name, entry)
+    if when == 'missing buff' then
+        local selfId = 0
+        pcall(function() selfId = mq.TLO.Me.ID() or 0 end)
+        if targetId == selfId then return false end
+        local sp = runtime.actionSpell(name, entry)
+        local single, effect = false, name
+        pcall(function()
+            single = sp.Beneficial() == true and tostring(sp.TargetType() or ''):lower() == 'single'
+            effect = sp.Name()
+        end)
+        return single and runtime.groupBuffStatus(targetId, effect) == nil
+    end
+    local kind = type(when) == 'string' and when:match('^has (.+)$')
+    if not AFFLICTION_MEMBERS[kind] and kind ~= 'Poison/Disease' then return false end
+    if kind == 'Poison/Disease' then
+        return runtime.groupAfflictionStatus(targetId, 'Poison') == nil
+            or runtime.groupAfflictionStatus(targetId, 'Disease') == nil
+    end
+    return runtime.groupAfflictionStatus(targetId, kind) == nil
+end
+
+function runtime.finishGroupCureProbe(reason)
+    local probe = runtime.groupCureProbe
+    runtime.groupCureProbe = nil
+    if not probe or (not probe.startedAt and not reason) then return end
+    runtime.groupCureRetryAt = runtime.groupCureRetryAt or {}
+    runtime.groupCureRetryAt[probe.id] = os.clock() + 3
+    if reason and os.clock() >= (runtime.nextGroupCureWarningAt or 0) then
+        runtime.nextGroupCureWarningAt = os.clock() + 30
+        local kind = probe.when == 'missing buff' and 'buff' or 'cure'
+        print('\ay[Triune]\ax group ' .. kind .. ' inspection ' .. reason .. '; retrying in 3s.')
+    end
+    if not probe.startedAt then return end
+    if (mq.TLO.Target.ID() or 0) ~= probe.id then return end
+    if probe.originalId > 0 and isSpawnAlive(probe.originalId) then
+        runtime.setTarget(probe.originalId)
+    elseif probe.originalId == 0 then
+        runtime.clearTarget()
+    end
+end
+
+function runtime.isGroupCureProbeReady(entry, name)
+    if not loadout or not entry then return false end
+    if entry.enabled == false or (tonumber(entry.pct) or 100) <= 0
+        or (entry.burn_only and not ctrl.burn) then return false end
+    for _, c in ipairs(loadout.clickies or {}) do
+        if c == entry then
+            return c.enabled ~= false
+                and runtime.isClickieReady(c)
+                and os.clock() - (tonumber(runtime.lastCast['c_' .. c.name]) or 0) >= 1.5
+        end
+    end
+    for i, g in ipairs(loadout.gems or {}) do
+        if g == entry then
+            local slot = tonumber(g.gem) or math.min(i, 12)
+            local ready, memmed, manaOk, pctMana = false, false, false, 0
+            pcall(function()
+                memmed = isGemMatching(slot, g.spell) or (mq.TLO.Me.Gem(g.spell)() or 0) > 0
+                manaOk = (mq.TLO.Me.CurrentMana() or 0) >= (mq.TLO.Spell(g.spell).Mana() or 0)
+                ready = memmed and mq.TLO.Me.SpellReady(g.spell)()
+                pctMana = mq.TLO.Me.PctMana() or 100
+            end)
+            -- An idle off-bar buff can be inspected before the existing downtime swap memorizes it.
+            if not memmed and g.when == 'missing buff' and ctrl.downtime_buffing ~= false
+                and not isCombat() and not runtime.hasDowntimeAggroThreat() then
+                ready = true
+            end
+            if not runtime.isHealAction(g.spell, g.target, g) and not ctrl.burn
+                and pctMana < (tonumber(ctrl.min_mana_pct) or 0) then
+                return false
+            end
+            return ready == true and manaOk and hasSpellReagents(g.spell)
+                and os.clock() - (tonumber(runtime.lastCast['g' .. slot]) or 0) >= 1.2
+        end
+    end
+    for _, a in pairs(loadout.aas or {}) do
+        if a == entry then
+            local ready, resourcesOk = false, true
+            pcall(function()
+                ready = mq.TLO.Me.AltAbilityReady(name)()
+                local sp = runtime.actionSpell(name, a)
+                if sp then
+                    resourcesOk = false
+                    resourcesOk = (mq.TLO.Me.CurrentMana() or 0) >= (tonumber(sp.Mana()) or 0)
+                        and (mq.TLO.Me.CurrentEndurance() or 0) >= (tonumber(sp.EnduranceCost()) or 0)
+                end
+            end)
+            return a.enabled == true and ready == true
+                and resourcesOk
+                and os.clock() >= (tonumber(runtime.lastCast['a' .. name]) or 0)
+                and not runtime.aaGroupBusy(name, a)
+        end
+    end
+    for _, a in pairs(loadout.actions or {}) do
+        if a == entry then return a.enabled == true and runtime.isSkillReady(name) end
+    end
+    for _, d in pairs(loadout.discs or {}) do
+        if d == entry then return d.enabled == true and runtime.isDiscReady(name) end
+    end
+    return false
+end
+
+function runtime.processGroupCureProbe()
+    local probe = runtime.groupCureProbe
+    if not probe then return false end
+    if not runtime.isGroupCureProbeReady(probe.entry, probe.spell)
+        or not isSpawnAlive(probe.id) or not runtime.isTargetInRange(probe.spell, probe.id, probe.entry) then
+        runtime.finishGroupCureProbe()
+        return false
+    end
+    if probe.startedAt and (mq.TLO.Target.ID() or 0) ~= probe.id then
+        runtime.finishGroupCureProbe()
+        return false
+    end
+    local ready = false
+    pcall(function() ready = (mq.TLO.Target.ID() or 0) == probe.id and mq.TLO.Target.BuffsPopulated() == true end)
+    -- Cure or buff status can arrive over Box Network while target buffs are pending.
+    if not runtime.groupCureNeedsProbe(probe.id, probe.when, probe.spell, probe.entry) then
+        if ready then
+            runtime.groupCureObserved = runtime.groupCureObserved or {}
+            runtime.groupCureObserved[probe.id] = os.clock()
+        end
+        runtime.finishGroupCureProbe()
+        return false
+    end
+    if not probe.startedAt then
+        probe.originalId = mq.TLO.Target.ID() or 0
+        if not runtime.setTarget(probe.id) then
+            runtime.finishGroupCureProbe('could not select target #' .. probe.id)
+            return false
+        end
+        probe.startedAt = os.clock()
+        return true
+    end
+    if os.clock() - probe.startedAt >= 0.5 then
+        runtime.finishGroupCureProbe('timed out waiting for target buffs')
+        return false
+    end
+    return true
+end
 
 -- 2a'. Box Network heartbeat counters (no NetBots / EQBC needed).
 function runtime.boxnetHasCounter(cleanName, key)
@@ -18034,65 +18372,7 @@ local function hasAffliction(targetId, kind)
         return debuffCnt > 0
     end
 
-    -- 2. Check other spawns (group members, box characters, target)
-    local s = nil
-    pcall(function() s = mq.TLO.Spawn(targetId) end)
-    if not s or not s() then return false end
-
-    local cleanName = ''
-    pcall(function() cleanName = s.CleanName() or '' end)
-
-    -- 2a. NetBots check (trio / box group members sharing debuff counters)
-    if cleanName ~= '' then
-        local nbCnt = 0
-        pcall(function()
-            local nb = mq.TLO.NetBots(cleanName)
-            if nb and nb() then
-                nbCnt = tonumber(nb[flag]()) or 0
-                if nbCnt == 0 then
-                    local det = tostring(nb.Detrimental() or '')
-                    if det:find(kind) then nbCnt = 1 end
-                end
-            end
-        end)
-        if nbCnt > 0 then return true end
-        if runtime.boxnetHasCounter and runtime.boxnetHasCounter(cleanName, members.boxnet) then return true end
-    end
-
-    -- 2b. Current Target check
-    local isTarget = false
-    pcall(function() isTarget = ((mq.TLO.Target.ID() or 0) == targetId) end)
-    if isTarget then
-        local tgtAfflicted = false
-        pcall(function()
-            local p = mq.TLO.Target[flag]
-            if p and p() then
-                local str = tostring(p())
-                if str ~= '' and str ~= 'NULL' and str ~= 'nil' then
-                    tgtAfflicted = true
-                end
-            end
-        end)
-        if tgtAfflicted then return true end
-    end
-
-    -- 2c. Group Member check
-    local total = 0
-    pcall(function() total = mq.TLO.Group.Members() or 0 end)
-    for i = 0, total do
-        local m = nil
-        pcall(function() m = mq.TLO.Group.Member(i) end)
-        if m and m() and (m.ID() or 0) == targetId then
-            local memAfflicted = false
-            pcall(function()
-                if m[flag] and m[flag]() then memAfflicted = true end
-                if m[counter] and (tonumber(m[counter]()) or 0) > 0 then memAfflicted = true end
-            end)
-            if memAfflicted then return true end
-        end
-    end
-
-    return false
+    return runtime.groupAfflictionStatus(targetId, kind) == true
 end
 
 local function isPoisoned(targetId) return hasAffliction(targetId, 'Poison') end
@@ -18125,57 +18405,7 @@ local function isCursed(targetId)
         return debuffC > 0
     end
 
-    local s = nil
-    pcall(function() s = mq.TLO.Spawn(targetId) end)
-    if not s or not s() then return false end
-    local cleanName = ''
-    pcall(function() cleanName = s.CleanName() or '' end)
-    if cleanName ~= '' then
-        local nbC = 0
-        pcall(function()
-            local nb = mq.TLO.NetBots(cleanName)
-            if nb and nb() then
-                nbC = tonumber(nb.Cursed()) or 0
-                if nbC == 0 and nb.CountersCurse then
-                    nbC = tonumber(nb.CountersCurse()) or 0
-                end
-                if nbC == 0 then
-                    local det = tostring(nb.Detrimental() or '')
-                    if det:find('Curse') then nbC = 1 end
-                end
-            end
-        end)
-        if nbC > 0 then return true end
-        if runtime.boxnetHasCounter and runtime.boxnetHasCounter(cleanName, 'curse') then return true end
-    end
-
-    if (mq.TLO.Target.ID() or 0) == targetId then
-        local tc = false
-        pcall(function()
-            local c = mq.TLO.Target.Cursed
-            if c and c() then
-                local str = tostring(c())
-                if str ~= '' and str ~= 'NULL' and str ~= 'nil' then tc = true end
-            end
-        end)
-        if tc then return true end
-    end
-
-    local total = 0
-    pcall(function() total = mq.TLO.Group.Members() or 0 end)
-    for i = 0, total do
-        local m = nil
-        pcall(function() m = mq.TLO.Group.Member(i) end)
-        if m and m() and (m.ID() or 0) == targetId then
-            local mc = false
-            pcall(function()
-                if m.Cursed and m.Cursed() then mc = true end
-                if m.CountersCurse and (tonumber(m.CountersCurse()) or 0) > 0 then mc = true end
-            end)
-            if mc then return true end
-        end
-    end
-    return false
+    return runtime.groupAfflictionStatus(targetId, 'Curse') == true
 end
 
 local function isCorrupted(targetId)
@@ -18199,57 +18429,7 @@ local function isCorrupted(targetId)
         return debuffCorr > 0
     end
 
-    local s = nil
-    pcall(function() s = mq.TLO.Spawn(targetId) end)
-    if not s or not s() then return false end
-    local cleanName = ''
-    pcall(function() cleanName = s.CleanName() or '' end)
-    if cleanName ~= '' then
-        local nbCorr = 0
-        pcall(function()
-            local nb = mq.TLO.NetBots(cleanName)
-            if nb and nb() then
-                nbCorr = tonumber(nb.Corrupted()) or 0
-                if nbCorr == 0 and nb.CountersCorruption then
-                    nbCorr = tonumber(nb.CountersCorruption()) or 0
-                end
-                if nbCorr == 0 then
-                    local det = tostring(nb.Detrimental() or '')
-                    if det:find('Corruption') then nbCorr = 1 end
-                end
-            end
-        end)
-        if nbCorr > 0 then return true end
-        if runtime.boxnetHasCounter and runtime.boxnetHasCounter(cleanName, 'corruption') then return true end
-    end
-
-    if (mq.TLO.Target.ID() or 0) == targetId then
-        local tcorr = false
-        pcall(function()
-            local c = mq.TLO.Target.Corrupted
-            if c and c() then
-                local str = tostring(c())
-                if str ~= '' and str ~= 'NULL' and str ~= 'nil' then tcorr = true end
-            end
-        end)
-        if tcorr then return true end
-    end
-
-    local total = 0
-    pcall(function() total = mq.TLO.Group.Members() or 0 end)
-    for i = 0, total do
-        local m = nil
-        pcall(function() m = mq.TLO.Group.Member(i) end)
-        if m and m() and (m.ID() or 0) == targetId then
-            local mc = false
-            pcall(function()
-                if m.Corrupted and m.Corrupted() then mc = true end
-                if m.CountersCorruption and (tonumber(m.CountersCorruption()) or 0) > 0 then mc = true end
-            end)
-            if mc then return true end
-        end
-    end
-    return false
+    return runtime.groupAfflictionStatus(targetId, 'Corruption') == true
 end
 
 function runtime.resolvePetTargetId(when, spellName, cls, pct)
@@ -18460,6 +18640,8 @@ function runtime.anyGroupMemberId(token, when, pct, spellName, cls, extra)
     local candidates, seen = {}, {}
     local selfOnly = when == 'my HP <=' or when == 'my Mana <='
     local selfFirst = baseTok(token) == 'Me, then Group'
+    local cureKind = type(when) == 'string' and when:match('^has (.+)$')
+    local cure = AFFLICTION_MEMBERS[cureKind] ~= nil or cureKind == 'Poison/Disease'
 
     local function addCandidate(id)
         id = tonumber(id) or 0
@@ -18470,7 +18652,7 @@ function runtime.anyGroupMemberId(token, when, pct, spellName, cls, extra)
         if not alive then return end
         if id ~= selfId then
             local inRange = false
-            pcall(function() inRange = runtime.isTargetInRange(spellName, id) end)
+            pcall(function() inRange = runtime.isTargetInRange(spellName, id, extra) end)
             if not inRange then return end
         end
         candidates[#candidates + 1] = id
@@ -18500,6 +18682,13 @@ function runtime.anyGroupMemberId(token, when, pct, spellName, cls, extra)
     for _, id in ipairs(candidates) do
         if runtime.conditionMet(when, pct, spellName, id, cls, 'F: ' .. baseTok(token), extra) then
             return id
+        end
+        if (cure or when == 'missing buff') and id ~= selfId
+            and runtime.groupCureNeedsProbe(id, when, spellName, extra)
+            and not runtime.groupCureProbe
+            and os.clock() >= ((runtime.groupCureRetryAt and runtime.groupCureRetryAt[id]) or 0)
+            and runtime.isGroupCureProbeReady(extra, spellName) then
+            runtime.groupCureProbe = { id = id, spell = spellName, when = when, entry = extra }
         end
     end
     return nil
@@ -18687,10 +18876,26 @@ function runtime.conditionMet(when, pct, spellName, targetId, cls, token, extra)
     if when == 'missing buff' then
         if not targetId or targetId <= 0 or not isSpawnAlive(targetId) then return false end
         if bardKeepSinging(extra) then return true end -- sung continuously, never gated on the effect
-        local key = sungKey(spellName, targetId)
-        if runtime.sungBuffs[key] and not bardSongDropped(key, targetId, spellName) then return false end -- already sung this life
+        local effectName = spellName
+        local sp = runtime.actionSpell(spellName, extra)
+        pcall(function() effectName = sp.Name() or spellName end)
+        local b = token and baseTok(token)
+        if (b == 'Me, then Group' or b == 'Group, then Me') and not sp then
+            if os.clock() >= (runtime.nextGroupCureWarningAt or 0) then
+                runtime.nextGroupCureWarningAt = os.clock() + 30
+                print('\ay[Triune]\ax ordered buff "' .. tostring(spellName)
+                    .. '" has no spell effect metadata; cannot determine recipient buff status.')
+            end
+            return false
+        end
+        if (b == 'Me, then Group' or b == 'Group, then Me')
+            and runtime.groupCureNeedsProbe(targetId, when, spellName, extra) then
+            return false
+        end
+        local key = sungKey(effectName, targetId)
+        if runtime.sungBuffs[key] and not bardSongDropped(key, targetId, effectName) then return false end -- already sung this life
         local minSec = (not isCombat() and ctrl and tonumber(ctrl.buff_refresh_sec) or 0) or 0
-        return not buffActive(targetId, spellName, minSec)
+        return not buffActive(targetId, effectName, minSec)
     end
     -- Pet-summon gems: this server keeps a separate simultaneous pet per pet
     -- class, so this asks whether THIS gem's own class has a living tracked pet
@@ -19485,6 +19690,22 @@ runtime.fireSkill = function(name, a, id)
     return true
 end
 
+function runtime.isClickieReady(c)
+    if not c or not c.name or c.name == '' then return false end
+    local fi = mq.TLO.FindItem('=' .. c.name)
+    if not fi or not fi() then fi = mq.TLO.FindItem(c.name) end
+    if not fi or not fi() then return false end
+    local ready = false
+    pcall(function()
+        if mq.TLO.Me.ItemReady(c.name)() then
+            ready = true
+        elseif fi.TimerReady and tonumber(fi.TimerReady()) == 0 then
+            ready = true
+        end
+    end)
+    return ready, fi
+end
+
 runtime.useClickie = function(c, id)
     if not c or not c.name or c.name == '' then return false end
     local effName = (c.spell and c.spell ~= '') and c.spell or c.name
@@ -19496,18 +19717,7 @@ runtime.useClickie = function(c, id)
     local key = 'c_' .. c.name
     if (os.clock() - (tonumber(runtime.lastCast[key]) or 0)) < 1.5 then return false end
 
-    local fi = mq.TLO.FindItem('=' .. c.name)
-    if not fi or not fi() then fi = mq.TLO.FindItem(c.name) end
-    if not fi or not fi() then return false end
-
-    local ready = false
-    pcall(function()
-        if mq.TLO.Me.ItemReady(c.name)() then
-            ready = true
-        elseif fi.TimerReady and tonumber(fi.TimerReady()) == 0 then
-            ready = true
-        end
-    end)
+    local ready, fi = runtime.isClickieReady(c)
     if not ready then return false end
 
     local castMs = 0
@@ -19519,20 +19729,18 @@ runtime.useClickie = function(c, id)
         if isCasting() or isMoveActive() or isMoving then return false end
     end
 
-    local dur = 0
-    if c.spell and c.spell ~= '' then
-        pcall(function() dur = tonumber(mq.TLO.Spell(c.spell).Duration()) or 0 end)
-        dur = tonumber(dur) or 0
-        if dur > 0 and buffActive(id, c.spell) then
-            return false
-        end
-    end
+    local sp, effectName, dur = runtime.actionSpell(effName, c), effName, 0
+    pcall(function()
+        effectName = sp.Name() or effName
+        dur = tonumber(sp.Duration()) or 0
+    end)
+    if dur > 0 and buffActive(id, effectName) then return false end
 
     local selfCast = (id == mq.TLO.Me.ID())
     local orig = mq.TLO.Target.ID() or 0
     local wasAttacking = mq.TLO.Me.Combat()
     local hostileTarget = (orig > 0 and isHostileTarget and isHostileTarget(orig)) == true
-    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isRedirectableHeal(effName, c))
+    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isRedirectableHeal(effName, c, sp))
     local needsTarget = (orig ~= id) and not keepHostile
     if needsTarget and not runtime.setTarget(id) then return false end
 
@@ -19546,7 +19754,7 @@ runtime.useClickie = function(c, id)
     if keepHostile then
         castTracker.targetRequired = false
     else
-        castTracker.targetRequired = isDet or isTargetRequiredSpell(effName) or selfCast
+        castTracker.targetRequired = isDet or isTargetRequiredSpell(sp or effName) or selfCast
     end
     castTracker.castStartTime  = os.clock()
 
@@ -19634,6 +19842,9 @@ end
 function runtime.processHealPriority()
     if isCasting() or isCastingOrStarting() then return false end
     if not loadout then return false end
+    if runtime.groupCureProbe and runtime.groupCureProbe.startedAt then
+        runtime.processGroupCureProbe()
+    end
 
     local eligibleHeals = {}
 
@@ -19717,7 +19928,7 @@ function runtime.processHealPriority()
                 if aPct > 0 and (not a.burn_only or ctrl.burn) and not runtime.aaGroupBusy(name, a) then
                     local id = runtime.resolveTargetId(a.target, a.cls, a.when, name, aPct, a)
                     if id and isSpawnAlive(id) then
-                        local rangeOk = (id == mq.TLO.Me.ID()) or runtime.isTargetInRange(name, id)
+                        local rangeOk = (id == mq.TLO.Me.ID()) or runtime.isTargetInRange(name, id, a)
                         if rangeOk and runtime.conditionMet(a.when, aPct, name, id, a.cls, a.target, a) then
                             local ready = false
                             pcall(function() ready = mq.TLO.Me.AltAbilityReady(name)() end)
@@ -19780,10 +19991,10 @@ function runtime.processHealPriority()
                 if cPct > 0 and (not c.burn_only or ctrl.burn) then
                     local id = runtime.resolveTargetId(c.target, 'ALL', c.when, effName, cPct, c)
                     if id and isSpawnAlive(id) then
-                        local rangeOk = (id == mq.TLO.Me.ID()) or runtime.isTargetInRange(effName, id)
+                        local rangeOk = (id == mq.TLO.Me.ID()) or runtime.isTargetInRange(effName, id, c)
                         local lockedOut = castTracker and castTracker.isLockedOut(effName, id, c.kind)
                         if rangeOk and not lockedOut and runtime.conditionMet(c.when, cPct, effName, id, 'ALL', c.target, c) then
-                            local ready = (not runtime.isClickieReady) or runtime.isClickieReady(c)
+                            local ready = runtime.isClickieReady(c)
                             if ready then
                                 local targetHp = pctHP(id) or 100
                                 eligibleHeals[#eligibleHeals + 1] = {
@@ -19834,7 +20045,8 @@ function runtime.processHealPriority()
         end
     end
 
-    if #eligibleHeals == 0 then return false end
+    if #eligibleHeals == 0 then return runtime.processGroupCureProbe() end
+    runtime.finishGroupCureProbe()
 
     -- Sort eligible heals:
     -- 1. Lowest target HP percentage (most damaged target first)
@@ -23331,6 +23543,9 @@ end
 
 runtime.onZoned = function()
     runtime.wpReset(false)
+    runtime.groupCureProbe = nil
+    runtime.groupCureObserved = nil
+    runtime.groupCureRetryAt = nil
     local now = os.clock()
     if (now - (runtime.lastZonedAt or 0)) < 2.0 then return end
     runtime.lastZonedAt = now
@@ -23502,7 +23717,8 @@ function runtime.tickPendingDowntimeReady()
         finish()
         if mq.TLO.Me.Sitting() or mq.TLO.Me.Ducking() then mq.cmd('/stand') end
         if pend.castAfter then
-            runtime.interruptedSwap = { slot = pend.slot, spell = pend.spell, targetId = pend.targetId, entry = pend.entry }
+            runtime.interruptedSwap = { slot = pend.slot, spell = pend.spell, targetId = pend.targetId,
+                entry = pend.entry, fixedTarget = pend.fixedTarget }
             print(string.format('\ar[Triune]\ax Aggro threat detected while waiting for "%s" to ready! Aborting to engage combat.', pend.spell))
         end
         return true
@@ -23517,7 +23733,13 @@ function runtime.tickPendingDowntimeReady()
         runtime.lastDowntimeSwapAt = runtime.lastDowntimeSwapAt or {}
         runtime.lastDowntimeSwapAt[pend.spell] = os.clock()
         if rdy then
-            runtime.castGem(pend.slot, pend.entry, pend.targetId)
+            local targetId = pend.targetId
+            local token = baseTok(pend.entry.target)
+            if not pend.fixedTarget and (token == 'Me, then Group' or token == 'Group, then Me') then
+                local g = pend.entry
+                targetId = runtime.resolveTargetId(g.target, g.cls, g.when, g.spell, tonumber(g.pct) or 100, g)
+            end
+            if targetId then runtime.castGem(pend.slot, pend.entry, targetId) end
         else
             print(string.format('\ay[Triune]\ax "%s" did not become ready within 6 s after memorizing; will retry on a later pass.', pend.spell))
         end
@@ -23542,6 +23764,7 @@ function runtime.processDowntimeBuffing()
     local candidate = nil
     local candidateTargetId = 0
     local targetGem = 0
+    local fixedTarget = false
 
     -- Only search for missing buffs to swap to if downtime_buffing is enabled
     if ctrl.downtime_buffing ~= false then
@@ -23554,6 +23777,7 @@ function runtime.processDowntimeBuffing()
                 candidate = g
                 candidateTargetId = resume.targetId
                 targetGem = tonumber(resume.slot) or (tonumber(g.gem) or 1)
+                fixedTarget = resume.fixedTarget == true
             end
         end
         if not candidate then
@@ -23568,6 +23792,7 @@ function runtime.processDowntimeBuffing()
                     candidate = entry
                     candidateTargetId = targetId
                     targetGem = tonumber(entry.gem) or math.min(slot, 12)
+                    fixedTarget = true
                     req.cast = (req.cast or 0) + 1
                 else
                     req.tries[entry.spell] = 8 -- out of range: give up on this one
@@ -23583,7 +23808,7 @@ function runtime.processDowntimeBuffing()
                     local pctVal = tonumber(g.pct) or 100
                     if pctVal > 0 and (not g.burn_only or ctrl.burn) then
                         local targetGemSlot = tonumber(g.gem) or math.min(i, 12)
-                        local targetId = runtime.resolveTargetId(g.target, g.cls, g.when, g.spell, pctVal)
+                        local targetId = runtime.resolveTargetId(g.target, g.cls, g.when, g.spell, pctVal, g)
                         if targetId and targetId > 0 and runtime.conditionMet(g.when, pctVal, g.spell, targetId, g.cls, g.target, g) then
                             local lockedOut = castTracker and castTracker.isLockedOut(g.spell, targetId, g.kind)
                             local hasReagents = hasSpellReagents(g.spell)
@@ -23635,7 +23860,8 @@ function runtime.processDowntimeBuffing()
 
             if not memSuccess then
                 if runtime.hasDowntimeAggroThreat() then
-                    runtime.interruptedSwap = { slot = targetGem, spell = candidate.spell, targetId = candidateTargetId, entry = candidate }
+                    runtime.interruptedSwap = { slot = targetGem, spell = candidate.spell, targetId = candidateTargetId,
+                        entry = candidate, fixedTarget = fixedTarget }
                     print(string.format('\ar[Triune]\ax Aggro threat detected while swapping to "%s"! Aborting swap to engage combat.', candidate.spell))
                 else
                     print(string.format('\ar[Triune]\ax Failed to memorize "%s" into Gem %d during downtime swap.', candidate.spell, targetGem))
@@ -23651,7 +23877,7 @@ function runtime.processDowntimeBuffing()
             -- later ticks (see tickPendingDowntimeReady) so the loop stays live.
             runtime.pendingDowntimeReady = {
                 slot = targetGem, spell = candidate.spell, targetId = candidateTargetId,
-                entry = candidate, since = os.clock(), castAfter = true,
+                entry = candidate, since = os.clock(), castAfter = true, fixedTarget = fixedTarget,
             }
             return
         end
@@ -23669,7 +23895,7 @@ function runtime.processDowntimeBuffing()
                     if g and (tonumber(g.gem) or 1) == slot and g.spell and g.spell ~= '' and not isGemMatching(primarySpell, g.spell) then
                         local pctVal = tonumber(g.pct) or 100
                         if pctVal > 0 and (not g.burn_only or ctrl.burn) and (g.when == 'missing buff' or g.when == 'always') then
-                            local targetId = runtime.resolveTargetId(g.target, g.cls, g.when, g.spell, pctVal)
+                            local targetId = runtime.resolveTargetId(g.target, g.cls, g.when, g.spell, pctVal, g)
                             if targetId and targetId > 0 and runtime.conditionMet(g.when, pctVal, g.spell, targetId, g.cls, g.target, g) then
                                 local lockedOut = castTracker and castTracker.isLockedOut(g.spell, targetId, g.kind)
                                 local hasReagents = hasSpellReagents(g.spell)
@@ -23954,9 +24180,6 @@ local function combatTick()
         runtime.nextHazardDecayAt = os.time() + 60
     end
     runtime.checkGemMemSync()
-    if (ctrl.mode == 'Manual' and ctrl.manual_auto_xtarget ~= false) or ctrl.mode == 'Puller' then
-        checkAggroSwitch()
-    end
 
     -- ========================================================================
     -- HEALING PRIORITY DISPATCH
@@ -23965,6 +24188,11 @@ local function combatTick()
     -- ========================================================================
     if runtime.processHealPriority and runtime.processHealPriority() then
         return
+    end
+
+    -- Heal dispatch holds pending group-inspection targets while still allowing emergency heals.
+    if (ctrl.mode == 'Manual' and ctrl.manual_auto_xtarget ~= false) or ctrl.mode == 'Puller' then
+        checkAggroSwitch()
     end
 
     -- Mesh isolation recovery owns movement while it runs; the mode logic
@@ -24872,7 +25100,7 @@ local function combatTick()
                     bossOk = not not (bs() and bs.Named())
                 end
                 if id and bossOk and conditionMet(a.when, aPct, name, id, a.cls, a.target, a) then
-                    if not isDet or (isHostileTarget(id) and isTargetInRange(name, id)) then
+                    if not isDet or (isHostileTarget(id) and isTargetInRange(name, id, a)) then
                         fireAA(name, a, id)
                     end
                 end
@@ -25033,12 +25261,15 @@ local function combatTick()
                 if not lockedOut then
                     local condOk = id and conditionMet(c.when, cPct, effName, id, 'ALL', c.target, c)
                     if condOk then
-                        local targetValid = (id == mq.TLO.Me.ID()) or (not isDet and runtime.isTargetInRange(effName, id)) or (isDet and isHostileTarget(id) and isTargetInRange(effName, id))
+                        local targetValid = (id == mq.TLO.Me.ID()) or (not isDet and runtime.isTargetInRange(effName, id, c)) or (isDet and isHostileTarget(id) and isTargetInRange(effName, id, c))
                         if targetValid and runtime.useClickie(c, id) then
-                            if c.when == 'missing buff' and c.spell and c.spell ~= '' then
-                                local bene = false
-                                pcall(function() bene = mq.TLO.Spell(c.spell).Beneficial() end)
-                                if bene then markSung(sungKey(c.spell, id), 'ALL') end
+                            if c.when == 'missing buff' then
+                                local bene, effectName = false, nil
+                                pcall(function()
+                                    local sp = runtime.actionSpell(effName, c)
+                                    bene, effectName = sp.Beneficial(), sp.Name()
+                                end)
+                                if bene and effectName then markSung(sungKey(effectName, id), 'ALL') end
                             end
                             break
                         end
@@ -26283,6 +26514,7 @@ local function runMainLoop()
             runtime.lastTick = os.clock()
             runtime.wasRunning = true
         elseif not ctrl.running then
+            runtime.finishGroupCureProbe()
             if runtime.wasRunning then
                 runtime.wasRunning = false
                 if runtime.fullStop then runtime.fullStop() end
@@ -26357,6 +26589,7 @@ function runtime.onMainLoopError(err)
     return runtime.lastCrash
 end
 if not xpcall(runMainLoop, runtime.onMainLoopError) then error(runtime.lastCrash, 0) end
+runtime.finishGroupCureProbe()
 if runtime.fullStop then pcall(runtime.fullStop) end -- attack / nav / stick were left running on window close
 runtime.saveLoadout(true, true)
 tlog.close('script exit')
