@@ -1,5 +1,13 @@
 # Triune AutoCombat Change Log
 
+## 2026-10-17
+
+- Repair Box Network cure reports: include each character's own affliction flags when client counter totals are zero, preserve unknown reads, and expire counter data by heartbeat age rather than unrelated message traffic. Fresh same-server, same-zone peer reports drive ordered cures without inspection and release pending inspection; older zero-only reports retain the existing fallback. Add report/freshness details to `/ac net debug`. Update both `lua/triune.lua` and `lua/tac/boxnet.lua` on participating characters (`README.md`, `tests/test_pure_logic.lua`).
+
+- Use complete Box Network 1.2.0 long-buff/song reports for ordered missing-buff decisions, avoiding inspection-only groupmate targeting while retaining explicit cast targets. Preserve ranked-name matching, remaining-time refresh checks, unknown/stale/older-peer fallback and emergency healing; sufficient fresh reports release pending buff inspection. Validate sparse-slot scans and report completeness, reuse them for explicit buff requests, and expose report status in `/ac net debug`. Update core and plugin on each participating character (`TAC/lua/triune.lua`, `TAC/lua/tac/boxnet.lua`, `README.md`, `tests/test_pure_logic.lua`).
+
+---
+
 ## Unreleased (after 3.2)
 
 - **Plugin `priority` for `onCommand` and `onBetweenPulls` (`TAC/lua/triune.lua`, `docs/HOOKS.md`, `.agents/AGENTS.md`, `tests/test_pure_logic.lua`). Behaviour change.** A plugin can declare `priority = <number>` on the table its file returns. When two plugins both answer `onCommand` or `onBetweenPulls`, the higher priority is asked first, ties go to the plugin id in plain string order, and a missing priority is 0. Before, these two hooks ran in plugin load order; no shipped plugin declares a priority, so shipped plugins now run in id order for these two hooks (every other hook is unchanged, including `wantsCombatHold`). Only a finite Lua number is valid: anything else (a string, even `'10'`, a table, a boolean, NaN, infinity) counts as 0 and writes one warning to the TAC log, and the plugin still loads. The value is read when the plugin is loaded, so an edited file needs a reload. New plugin API value `core.hookPriority` (experimental), checked with `core.hasCapability('hookPriority')`. Note: this is separate from the per-action `priority` (1 to 99) on spells, discs and clickies, which still runs lowest first. Decision record: `docs/decision_log.md` DL-003.
@@ -19,6 +27,10 @@
 - Support servers with four classes per character while retaining single-class and three-class setups. Add a fourth manual class selector and color, show every class in the status badges and window title, and include the fourth class's pet in pet controls and HUDs. Rename Box Network class labels and widen its class column to fit four abbreviations.
 
 - Fix clearing a class selector so choosing **-- None --** removes that class and compacts the remaining selections without losing the fourth class. Add regression coverage for four-class detection, editing, loadout collection, and pet reconciliation.
+
+- Hold automatic aggro switching until group cure inspection releases its ally target, so delayed buff data can arrive without cancelling the probe. Emergency HP heals still preempt inspection, and normal targeting resumes after completion or timeout (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).
+
+- Make ordered friendly selectors use each recipient's actual buff state, inspecting unavailable or stale group buff data instead of blindly rebuffing. Resolve AA/item effect metadata and ranges, support idle off-bar buff inspection before downtime memorization, and retain per-recipient HP heal ordering, caster-only conditions, emergency healing, explicit Box Network buff recipients, and target restoration (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).
 
 ---
 
